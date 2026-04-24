@@ -17,6 +17,8 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     # Priority: manual dispatch input > repo variable (vars.AI_PROVIDER) > default 'claude'
     env:
       AI_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.ai_provider || vars.AI_PROVIDER || 'claude' }}
