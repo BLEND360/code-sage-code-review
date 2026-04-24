@@ -3,79 +3,116 @@ name: AI Code Review
 on:
   pull_request:
     types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      ai_provider:
+        description: 'AI provider to use for this run'
+        required: false
+        default: 'claude'
+        type: choice
+        options:
+          - claude
+          - openai
 
 jobs:
   review:
     runs-on: ubuntu-latest
+    # Priority: manual dispatch input > repo variable (vars.AI_PROVIDER) > default 'claude'
+    env:
+      AI_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.ai_provider || vars.AI_PROVIDER || 'claude' }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get PR diff
-        id: diff
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }} > diff.txt
+          BASE_REF="${{ github.base_ref || 'main' }}"
+          git fetch origin "$BASE_REF"
+          git diff "origin/$BASE_REF" > diff.txt
 
-      - name: Read global rules
-        id: rules
+      - name: Build prompt
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          echo "RULES<<EOF" >> $GITHUB_OUTPUT
-          cat .github/review-guidelines.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          printf '%s\n' "$PR_BODY" > pr_body.txt
+          python3 -c "
+          template = open('.github/prompt-template.txt').read()
+          rules    = open('.github/review-guidelines.md').read()
+          pr_body  = open('pr_body.txt').read()
+          diff     = open('diff.txt').read()
+          open('prompt.txt', 'w').write(template.format(rules=rules, pr_body=pr_body, diff=diff))
+          "
 
-      - name: Get PR description
-        id: pr
+      - name: Call Claude API
+        id: claude
+        if: env.AI_PROVIDER == 'claude'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          echo "PR_BODY<<EOF" >> $GITHUB_OUTPUT
-          echo "${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Call AI for review
-        id: ai
-        run: |
-          PROMPT="You are a senior code reviewer.
-
-          GLOBAL RULES:
-          ${{ steps.rules.outputs.RULES }}
-
-          PR CONTEXT:
-          ${{ steps.pr.outputs.PR_BODY }}
-
-          CODE CHANGES:
-          $(cat diff.txt)
-
-          Review for:
-          - Bugs
-          - Security issues
-          - Code quality
-          - Missing validations
-          - Violations of rules
-
-          Give concise actionable comments."
-
-          RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
-            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+          PAYLOAD=$(jq -n --rawfile prompt prompt.txt '{
+            model: "claude-sonnet-4-6",
+            max_tokens: 1024,
+            messages: [{role: "user", content: $prompt}]
+          }')
+          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"model\": \"gpt-4o-mini\",
-              \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
-              \"temperature\": 0.3
-            }" | jq -r '.choices[0].message.content')
+            -d "$PAYLOAD") || { echo "::error::Claude API call failed"; exit 1; }
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // ("Claude error: " + (.error.message // "unknown"))')
+          echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$REVIEW" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-          echo "REVIEW<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESPONSE" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Call OpenAI API
+        id: openai
+        if: env.AI_PROVIDER == 'openai'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          PAYLOAD=$(jq -n --rawfile prompt prompt.txt '{
+            model: "gpt-4o-mini",
+            temperature: 0.3,
+            messages: [{role: "user", content: $prompt}]
+          }')
+          RESPONSE=$(curl -sf https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD") || { echo "::error::OpenAI API call failed"; exit 1; }
+          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ("OpenAI error: " + (.error.message // "unknown"))')
+          echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$REVIEW" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Post comment on PR
+      - name: Post review comment
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
+        env:
+          CLAUDE_REVIEW: ${{ steps.claude.outputs.REVIEW }}
+          OPENAI_REVIEW: ${{ steps.openai.outputs.REVIEW }}
+          AI_PROVIDER: ${{ env.AI_PROVIDER }}
         with:
           script: |
-            const review = `${{ steps.ai.outputs.REVIEW }}`;
-            github.rest.issues.createComment({
+            const provider = process.env.AI_PROVIDER;
+            const review   = process.env.CLAUDE_REVIEW || process.env.OPENAI_REVIEW;
+            const label    = provider === 'claude'
+              ? 'Claude Sonnet 4.6 (Anthropic)'
+              : 'GPT-4o-mini (OpenAI)';
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: "## 🤖 AI Code Review\n\n" + review
+              body: `## 🤖 AI Code Review — ${label}\n\n${review}`
             });
+
+      - name: Print review (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CLAUDE_REVIEW: ${{ steps.claude.outputs.REVIEW }}
+          OPENAI_REVIEW: ${{ steps.openai.outputs.REVIEW }}
+        run: |
+          echo "=== AI Review Output (provider: $AI_PROVIDER) ==="
+          printf '%s\n' "${CLAUDE_REVIEW:-$OPENAI_REVIEW}"
