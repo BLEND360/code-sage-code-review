@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       ai_provider:
-        description: 'AI provider to use for this run'
+        description: 'Primary AI provider for this run'
         required: false
         default: 'claude'
         type: choice
@@ -46,61 +46,86 @@ jobs:
           open('prompt.txt', 'w').write(template.format(rules=rules, pr_body=pr_body, diff=diff))
           "
 
-      - name: Call Claude API
-        id: claude
-        if: env.AI_PROVIDER == 'claude'
+      # Tries the configured primary provider. continue-on-error allows the
+      # fallback step to run if this fails (bad key, quota, outage, etc.)
+      - name: Call primary provider
+        id: primary
+        continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          PAYLOAD=$(jq -n --rawfile prompt prompt.txt '{
-            model: "claude-sonnet-4-6",
-            max_tokens: 1024,
-            messages: [{role: "user", content: $prompt}]
-          }')
-          RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD") || { echo "::error::Claude API call failed"; exit 1; }
-          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // ("Claude error: " + (.error.message // "unknown"))')
-          echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "$REVIEW" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Call OpenAI API
-        id: openai
-        if: env.AI_PROVIDER == 'openai'
-        env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          PAYLOAD=$(jq -n --rawfile prompt prompt.txt '{
-            model: "gpt-4o-mini",
-            temperature: 0.3,
-            messages: [{role: "user", content: $prompt}]
-          }')
-          RESPONSE=$(curl -sf https://api.openai.com/v1/chat/completions \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD") || { echo "::error::OpenAI API call failed"; exit 1; }
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ("OpenAI error: " + (.error.message // "unknown"))')
+          if [ "$AI_PROVIDER" = "claude" ]; then
+            PAYLOAD=$(jq -n --rawfile prompt prompt.txt \
+              '{model:"claude-sonnet-4-6",max_tokens:1024,messages:[{role:"user",content:$prompt}]}')
+            RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD")
+            REVIEW=$(echo "$RESPONSE" | jq -re '.content[0].text')
+            USED="Claude Sonnet 4.6 (Anthropic)"
+          else
+            PAYLOAD=$(jq -n --rawfile prompt prompt.txt \
+              '{model:"gpt-4o-mini",temperature:0.3,messages:[{role:"user",content:$prompt}]}')
+            RESPONSE=$(curl -sf https://api.openai.com/v1/chat/completions \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD")
+            REVIEW=$(echo "$RESPONSE" | jq -re '.choices[0].message.content')
+            USED="GPT-4o-mini (OpenAI)"
+          fi
           echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$REVIEW" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "USED=$USED" >> "$GITHUB_OUTPUT"
+
+      # Only runs if the primary provider failed — automatically uses the other provider.
+      - name: Call fallback provider
+        id: fallback
+        if: steps.primary.outcome == 'failure'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "::warning::Primary provider ($AI_PROVIDER) failed — switching to fallback."
+          if [ "$AI_PROVIDER" = "claude" ]; then
+            PAYLOAD=$(jq -n --rawfile prompt prompt.txt \
+              '{model:"gpt-4o-mini",temperature:0.3,messages:[{role:"user",content:$prompt}]}')
+            RESPONSE=$(curl -sf https://api.openai.com/v1/chat/completions \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD") || { echo "::error::Both Claude and OpenAI failed."; exit 1; }
+            REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ("OpenAI error: " + (.error.message // "unknown"))')
+            USED="GPT-4o-mini (OpenAI) ⚠️ fallback from Claude"
+          else
+            PAYLOAD=$(jq -n --rawfile prompt prompt.txt \
+              '{model:"claude-sonnet-4-6",max_tokens:1024,messages:[{role:"user",content:$prompt}]}')
+            RESPONSE=$(curl -sf https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD") || { echo "::error::Both OpenAI and Claude failed."; exit 1; }
+            REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // ("Claude error: " + (.error.message // "unknown"))')
+            USED="Claude Sonnet 4.6 (Anthropic) ⚠️ fallback from OpenAI"
+          fi
+          echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$REVIEW" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "USED=$USED" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
-          CLAUDE_REVIEW: ${{ steps.claude.outputs.REVIEW }}
-          OPENAI_REVIEW: ${{ steps.openai.outputs.REVIEW }}
-          AI_PROVIDER: ${{ env.AI_PROVIDER }}
+          PRIMARY_REVIEW: ${{ steps.primary.outputs.REVIEW }}
+          PRIMARY_USED: ${{ steps.primary.outputs.USED }}
+          FALLBACK_REVIEW: ${{ steps.fallback.outputs.REVIEW }}
+          FALLBACK_USED: ${{ steps.fallback.outputs.USED }}
         with:
           script: |
-            const provider = process.env.AI_PROVIDER;
-            const review   = process.env.CLAUDE_REVIEW || process.env.OPENAI_REVIEW;
-            const label    = provider === 'claude'
-              ? 'Claude Sonnet 4.6 (Anthropic)'
-              : 'GPT-4o-mini (OpenAI)';
+            const review = process.env.PRIMARY_REVIEW  || process.env.FALLBACK_REVIEW;
+            const label  = process.env.PRIMARY_USED    || process.env.FALLBACK_USED;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -111,8 +136,12 @@ jobs:
       - name: Print review (manual run)
         if: github.event_name == 'workflow_dispatch'
         env:
-          CLAUDE_REVIEW: ${{ steps.claude.outputs.REVIEW }}
-          OPENAI_REVIEW: ${{ steps.openai.outputs.REVIEW }}
+          PRIMARY_REVIEW: ${{ steps.primary.outputs.REVIEW }}
+          PRIMARY_USED: ${{ steps.primary.outputs.USED }}
+          FALLBACK_REVIEW: ${{ steps.fallback.outputs.REVIEW }}
+          FALLBACK_USED: ${{ steps.fallback.outputs.USED }}
         run: |
-          echo "=== AI Review Output (provider: $AI_PROVIDER) ==="
-          printf '%s\n' "${CLAUDE_REVIEW:-$OPENAI_REVIEW}"
+          LABEL="${PRIMARY_USED:-$FALLBACK_USED}"
+          REVIEW="${PRIMARY_REVIEW:-$FALLBACK_REVIEW}"
+          echo "=== AI Review — $LABEL ==="
+          printf '%s\n' "$REVIEW"
