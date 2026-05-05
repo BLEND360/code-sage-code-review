@@ -1,0 +1,32 @@
+# AI Code Review — Starter Template
+# Copy this file to your repo: .github/workflows/ai-review.yml
+#
+# Setup:
+# 1. Copy this file to .github/workflows/ai-review.yml
+# 2. Add secrets: Settings → Secrets → Actions
+#    - OPENAI_API_KEY (required if using openai)
+#    - ANTHROPIC_API_KEY (required if using claude)
+# 3. (Optional) Add .github/review-guidelines.md with your team's rules
+# 4. Open a PR — review comment will appear automatically!
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    uses: BLEND360/code-sage-code-review/.github/workflows/ai-review-reusable.yml@main
+    with:
+      # Choose your provider: 'openai' or 'claude'
+      ai_provider: 'openai'
+
+      # Path to your review guidelines (optional)
+      # review_guidelines_path: '.github/review-guidelines.md'
+
+      # Enable fallback to other provider if primary fails (default: true)
+      # enable_fallback: true
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
