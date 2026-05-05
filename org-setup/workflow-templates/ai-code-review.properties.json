@@ -1,0 +1,21 @@
+{
+  "name": "AI Code Review by BLEND360",
+  "description": "Automated PR reviews using OpenAI or Claude. Catches bugs, security vulnerabilities, and code quality issues automatically.",
+  "iconName": "code-review",
+  "categories": [
+    "Automation",
+    "Code Quality"
+  ],
+  "filePatterns": [
+    "**/*.js",
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.jsx",
+    "**/*.py",
+    "**/*.java",
+    "**/*.go",
+    "**/*.rb",
+    "**/*.php",
+    "**/*.cs"
+  ]
+}
