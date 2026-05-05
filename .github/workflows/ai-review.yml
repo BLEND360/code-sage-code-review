@@ -18,6 +18,9 @@ on:
 
 jobs:
   review:
+    permissions:
+      pull-requests: write
+      contents: read
     uses: ./.github/workflows/ai-review-reusable.yml
     with:
       ai_provider: ${{ github.event_name == 'workflow_dispatch' && inputs.ai_provider || 'openai' }}

@@ -30,9 +30,6 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      contents: read
     env:
       AI_PROVIDER: ${{ inputs.ai_provider }}
 
